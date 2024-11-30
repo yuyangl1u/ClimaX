@@ -2,7 +2,7 @@ seed_everything: 42
 
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  default_root_dir: ${oc.env:OUTPUT_DIR,/home/t-tungnguyen/ClimaX/exps/global_forecast_climax}
+  default_root_dir: /mnt/c/Users/Owner/ClimaX/logs
 
   precision: 16
 
@@ -11,8 +11,8 @@ trainer:
   accelerator: gpu
   strategy: ddp
 
-  min_epochs: 1
-  max_epochs: 100
+  min_epochs: 0
+  max_epochs: 3
   enable_progress_bar: true
 
   sync_batchnorm: True
@@ -135,10 +135,11 @@ model:
       mlp_ratio: 4
       drop_path: 0.1
       drop_rate: 0.1
-
+      parallel_patch_embed: false
+      dynamic_patch: true
 # ---------------------------- DATA -------------------------------------------
 data:
-  root_dir: /datadrive/datasets/5.625deg_equally_np/
+  root_dir: /mnt/data/5.625deg_npz/
   variables: [
       "land_sea_mask",
       "orography",
@@ -193,6 +194,6 @@ data:
   predict_range: 72
   hrs_each_step: 1
   buffer_size: 10000
-  batch_size: 128
+  batch_size: 16
   num_workers: 1
   pin_memory: False
