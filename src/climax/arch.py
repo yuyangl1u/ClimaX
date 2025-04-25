@@ -1,287 +1,25 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from functools import lru_cache
-
-import numpy as np
 import torch
-import torch.nn as nn
-from timm.models.vision_transformer import Block, PatchEmbed, trunc_normal_
+from climax.arch import ClimaX
 
-from climax.utils.pos_embed import (
-    get_1d_sincos_pos_embed_from_grid,
-    get_2d_sincos_pos_embed,
-)
-
-from .parallelpatchembed import ParallelVarPatchEmbed
-
-class LinearAttention(nn.Module):
-    """Linear attention mechanism to reduce quadratic complexity."""
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim)
-        self.output_proj = nn.Linear(embed_dim, embed_dim)
-
-    def forward(self, x):
-        # x: [B, L, D]
-        Q = self.q_proj(x)  # [B, L, D]
-        K = self.k_proj(x)  # [B, L, D]
-        V = self.v_proj(x)  # [B, L, D]
-
-        # Kernel trick: softmax over K dimension
-        K_softmax = softmax(K, dim=-2)  # [B, L, D]
-        QK = torch.einsum("blm,bln->bm", Q, K_softmax)  # [B, D]
-        attention = torch.einsum("bm,bln->bln", QK, V)  # [B, L, D]
-
-        return self.output_proj(attention)
-
-class ClimaX(nn.Module):
-    """Implements the ClimaX model as described in the paper,
-    https://arxiv.org/abs/2301.10343
-
-    Args:
-        default_vars (list): list of default variables to be used for training
-        img_size (list): image size of the input data
-        patch_size (int): patch size of the input data
-        embed_dim (int): embedding dimension
-        depth (int): number of transformer layers
-        decoder_depth (int): number of decoder layers
-        num_heads (int): number of attention heads
-        mlp_ratio (float): ratio of mlp hidden dimension to embedding dimension
-        drop_path (float): stochastic depth rate
-        drop_rate (float): dropout rate
-        parallel_patch_embed (bool): whether to use parallel patch embedding
-    """
-
-    def __init__(
-        self,
-        default_vars,
-        img_size=[32, 64],
-        patch_size=4, # tunred from 2 to 4
-        embed_dim=1024, # tunred from 1024 to 512
-        depth=4 ,# turned from 8 to 4
-        decoder_depth=2,
-        num_heads=4, # turned from 16 to 4
-        mlp_ratio=4.0,
-        drop_path=0.1,
-        drop_rate=0.1,
-        parallel_patch_embed=False,
-        dynamic_patch_embed=False,
-        dynamic_patch=True,
-    ):
-        super().__init__()
-
-        # TODO: remove time_history parameter
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.default_vars = default_vars
-        self.parallel_patch_embed = parallel_patch_embed
-        self.dynamic_patch = dynamic_patch
+class RegionalClimaX(ClimaX):
+    def __init__(self, default_vars, img_size=..., patch_size=2, embed_dim=1024, depth=8, decoder_depth=2, num_heads=16, mlp_ratio=4, drop_path=0.1, drop_rate=0.1):
+        super().__init__(default_vars, img_size, patch_size, embed_dim, depth, decoder_depth, num_heads, mlp_ratio, drop_path, drop_rate)
 
 
-        # Dynamic patch embedding
-        if self.dynamic_patch:
-            self.token_embeds = nn.ModuleList([
-                PatchEmbed(img_size, self.adjust_patch_size(i), 1, embed_dim)
-                for i in range(len(default_vars))
-            ])
-        elif self.parallel_patch_embed:
-            self.token_embeds = ParallelVarPatchEmbed(len(default_vars), img_size, patch_size, embed_dim)
-        else:
-            self.token_embeds = nn.ModuleList(
-                [PatchEmbed(img_size, patch_size, 1, embed_dim) for _ in range(len(default_vars))]
-            )
+        self.phys_vars = ["2m_temperature", "10m_u_component_of_wind", "geopotential_500"]
 
-        # Linear attention backbone
+        # 获取物理变量在输入中的通道索引
+        self.phys_var_indices = [default_vars.index(var) for var in self.phys_vars if var in default_vars]
+
+        # 替换原始Transformer块为物理引导的块
         self.blocks = nn.ModuleList([
-            LinearAttention(embed_dim) for _ in range(depth)
+            PhysicsAwareTransformerBlock(embed_dim, num_heads, self.phys_var_indices)
+            for _ in range(depth)
         ])
-        self.norm = nn.LayerNorm(embed_dim)
-
-
-        # variable tokenization: separate embedding layer for each input variable
-        if self.parallel_patch_embed:
-            self.token_embeds = ParallelVarPatchEmbed(len(default_vars), img_size, patch_size, embed_dim)
-            self.num_patches = self.token_embeds.num_patches
-        else:
-            self.token_embeds = nn.ModuleList(
-                [PatchEmbed(img_size, patch_size, 1, embed_dim) for i in range(len(default_vars))]
-            )
-            self.num_patches = self.token_embeds[0].num_patches
-
-        # variable embedding to denote which variable each token belongs to
-        # helps in aggregating variables
-        self.var_embed, self.var_map = self.create_var_embedding(embed_dim)
-
-        # variable aggregation: a learnable query and a single-layer cross attention
-        self.var_query = nn.Parameter(torch.zeros(1, 1, embed_dim), requires_grad=True)
-        self.var_agg = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-
-        # positional embedding and lead time embedding
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim), requires_grad=True)
-        self.lead_time_embed = nn.Linear(1, embed_dim)
-
-
-        # Initialize weights
-        self.initialize_weights()
-
-
-
-
-
-        # --------------------------------------------------------------------------
-
-        # ViT backbone
-        self.pos_drop = nn.Dropout(p=drop_rate)
-        dpr = [x.item() for x in torch.linspace(0, drop_path, depth)]  # stochastic depth decay rule
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    embed_dim,
-                    num_heads,
-                    mlp_ratio,
-                    qkv_bias=True,
-                    drop_path=dpr[i],
-                    norm_layer=nn.LayerNorm,
-                    drop=drop_rate,
-                )
-                for i in range(depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(embed_dim)
-
-        # --------------------------------------------------------------------------
-
-        # prediction head
-        self.head = nn.ModuleList()
-        for _ in range(decoder_depth):
-            self.head.append(nn.Linear(embed_dim, embed_dim))
-            self.head.append(nn.GELU())
-        self.head.append(nn.Linear(embed_dim, len(self.default_vars) * patch_size**2))
-        self.head = nn.Sequential(*self.head)
-
-        # --------------------------------------------------------------------------
-
-        self.initialize_weights()
-    def adjust_patch_size(self, var_index):
-        """Dynamically adjust patch size for each variable."""
-        base_patch_size = self.patch_size
-        scale_factor = (var_index + 1) % 3 + 1  # Example scaling
-        return base_patch_size * scale_factor
-
-    def forward_encoder(self, x, lead_times, variables):
-        if isinstance(variables, list):
-            variables = tuple(variables)
-
-        # Tokenize variables
-        embeds = []
-        for i, var in enumerate(variables):
-            embeds.append(self.token_embeds[i](x[:, i:i + 1]))
-        x = torch.cat(embeds, dim=1)
-
-        # Apply attention
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)
-
-        return x
-
-    def initialize_weights(self):
-        # Generate 2D sin-cos positional embedding
-        pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1],
-            int(self.img_size[0] / self.patch_size),
-            int(self.img_size[1] / self.patch_size),
-            cls_token=False,
-        )
-        # Assign the generated positional embedding
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # Initialize variable embeddings
-        var_embed = get_1d_sincos_pos_embed_from_grid(
-            self.var_embed.shape[-1], np.arange(len(self.default_vars))
-        )
-
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        var_embed = get_1d_sincos_pos_embed_from_grid(self.var_embed.shape[-1], np.arange(len(self.default_vars)))
-        self.var_embed.data.copy_(torch.from_numpy(var_embed).float().unsqueeze(0))
-
-        # token embedding layer
-        if self.parallel_patch_embed:
-            for i in range(len(self.token_embeds.proj_weights)):
-                w = self.token_embeds.proj_weights[i].data
-                trunc_normal_(w.view([w.shape[0], -1]), std=0.02)
-        else:
-            for i in range(len(self.token_embeds)):
-                w = self.token_embeds[i].proj.weight.data
-                trunc_normal_(w.view([w.shape[0], -1]), std=0.02)
-
-        # initialize nn.Linear and nn.LayerNorm
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def create_var_embedding(self, dim):
-        var_embed = nn.Parameter(torch.zeros(1, len(self.default_vars), dim), requires_grad=True)
-        # TODO: create a mapping from var --> idx
-        var_map = {}
-        idx = 0
-        for var in self.default_vars:
-            var_map[var] = idx
-            idx += 1
-        return var_embed, var_map
-
-    @lru_cache(maxsize=None)
-    def get_var_ids(self, vars, device):
-        ids = np.array([self.var_map[var] for var in vars])
-        return torch.from_numpy(ids).to(device)
-
-    def get_var_emb(self, var_emb, vars):
-        ids = self.get_var_ids(vars, var_emb.device)
-        return var_emb[:, ids, :]
-
-    def unpatchify(self, x: torch.Tensor, h=None, w=None):
-        """
-        x: (B, L, V * patch_size**2)
-        return imgs: (B, V, H, W)
-        """
-        p = self.patch_size
-        c = len(self.default_vars)
-        h = self.img_size[0] // p if h is None else h // p
-        w = self.img_size[1] // p if w is None else w // p
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum("nhwpqc->nchpwq", x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
-        return imgs
-
-    def aggregate_variables(self, x: torch.Tensor):
-        """
-        x: B, V, L, D
-        """
-        b, _, l, _ = x.shape
-        x = torch.einsum("bvld->blvd", x)
-        x = x.flatten(0, 1)  # BxL, V, D
-
-        var_query = self.var_query.repeat_interleave(x.shape[0], dim=0)
-        x, _ = self.var_agg(var_query, x, x)  # BxL, D
-        x = x.squeeze()
-
-        x = x.unflatten(dim=0, sizes=(b, l))  # B, L, D
-        return x
-
-    def forward_encoder(self, x: torch.Tensor, lead_times: torch.Tensor, variables):
+    def forward_encoder(self, x: torch.Tensor, lead_times: torch.Tensor, variables, region_info):
         # x: `[B, V, H, W]` shape.
 
         if isinstance(variables, list):
@@ -290,24 +28,24 @@ class ClimaX(nn.Module):
         # tokenize each variable separately
         embeds = []
         var_ids = self.get_var_ids(variables, x.device)
-
-        if self.parallel_patch_embed:
-            x = self.token_embeds(x, var_ids)  # B, V, L, D
-        else:
-            for i in range(len(var_ids)):
-                id = var_ids[i]
-                embeds.append(self.token_embeds[id](x[:, i : i + 1]))
-            x = torch.stack(embeds, dim=1)  # B, V, L, D
+        for i in range(len(var_ids)):
+            id = var_ids[i]
+            embeds.append(self.token_embeds[id](x[:, i : i + 1]))
+        x = torch.stack(embeds, dim=1)  # B, V, L, D
 
         # add variable embedding
         var_embed = self.get_var_emb(self.var_embed, variables)
         x = x + var_embed.unsqueeze(2)  # B, V, L, D
 
+        # get the patch ids corresponding to the region
+        region_patch_ids = region_info['patch_ids']
+        x = x[:, :, region_patch_ids, :]
+
         # variable aggregation
         x = self.aggregate_variables(x)  # B, L, D
 
         # add pos embedding
-        x = x + self.pos_embed
+        x = x + self.pos_embed[:, region_patch_ids, :]
 
         # add lead time embedding
         lead_time_emb = self.lead_time_embed(lead_times.unsqueeze(-1))  # B, D
@@ -323,24 +61,32 @@ class ClimaX(nn.Module):
 
         return x
 
-    def forward(self, x, y, lead_times, variables, out_variables, metric, lat):
+    def forward(self, x, y, lead_times, variables, out_variables, metric, lat, region_info):
         """Forward pass through the model.
 
         Args:
             x: `[B, Vi, H, W]` shape. Input weather/climate variables
             y: `[B, Vo, H, W]` shape. Target weather/climate variables
             lead_times: `[B]` shape. Forecasting lead times of each element of the batch.
+            region_info: Containing the region's information
 
         Returns:
             loss (list): Different metrics.
             preds (torch.Tensor): `[B, Vo, H, W]` shape. Predicted weather/climate variables.
         """
-        out_transformers = self.forward_encoder(x, lead_times, variables)  # B, L, D
+        out_transformers = self.forward_encoder(x, lead_times, variables, region_info)  # B, L, D
+        print("Encoder output shape:", out_transformers.shape)
         preds = self.head(out_transformers)  # B, L, V*p*p
-
-        preds = self.unpatchify(preds)
+        # 在 PhysicsAwareTransformerBlock 的 forward 方法中添加
+        self.log("train/phys_weight", self.phys_weight.item(), on_step=True)
+        min_h, max_h = region_info['min_h'], region_info['max_h']
+        min_w, max_w = region_info['min_w'], region_info['max_w']
+        preds = self.unpatchify(preds, h = max_h - min_h + 1, w = max_w - min_w + 1)
         out_var_ids = self.get_var_ids(tuple(out_variables), preds.device)
         preds = preds[:, out_var_ids]
+
+        y = y[:, :, min_h:max_h+1, min_w:max_w+1]
+        lat = lat[min_h:max_h+1]
 
         if metric is None:
             loss = None
@@ -349,6 +95,41 @@ class ClimaX(nn.Module):
 
         return loss, preds
 
-    def evaluate(self, x, y, lead_times, variables, out_variables, transform, metrics, lat, clim, log_postfix):
-        _, preds = self.forward(x, y, lead_times, variables, out_variables, metric=None, lat=lat)
+    def evaluate(self, x, y, lead_times, variables, out_variables, transform, metrics, lat, clim, log_postfix, region_info):
+        _, preds = self.forward(x, y, lead_times, variables, out_variables, metric=None, lat=lat, region_info=region_info)
+
+        min_h, max_h = region_info['min_h'], region_info['max_h']
+        min_w, max_w = region_info['min_w'], region_info['max_w']
+        y = y[:, :, min_h:max_h+1, min_w:max_w+1]
+        lat = lat[min_h:max_h+1]
+        clim = clim[:, min_h:max_h+1, min_w:max_w+1]
+
         return [m(preds, y, transform, out_variables, lat, clim, log_postfix) for m in metrics]
+
+    # 在 arch.py 中添加以下代码
+
+    class PhysicsAwareTransformerBlock(nn.Module):
+        """Transformer Block with enhanced attention to physics-related variables."""
+
+        def __init__(self, embed_dim, num_heads, physics_var_indices):
+            super().__init__()
+            self.attention = nn.MultiheadAttention(embed_dim, num_heads)
+            self.phys_var_indices = physics_var_indices  # 物理变量的通道索引列表
+            self.embed_dim = embed_dim
+
+            # 定义物理变量的注意力权重增强系数
+            self.phys_weight = nn.Parameter(torch.ones(1))
+
+        def forward(self, x):
+            # x shape: [Batch, Sequence, Embedding]
+            # 生成物理变量的注意力掩码
+            mask = torch.zeros(x.shape[1], dtype=torch.bool, device=x.device)
+            mask[self.phys_var_indices] = True  # 标记物理变量位置
+
+            # 增强物理变量的Query向量
+            query = x.clone()
+            query[:, mask] *= self.phys_weight  # 放大物理变量的Query
+
+            # 计算注意力
+            attn_output, _ = self.attention(query, x, x)
+            return attn_output
